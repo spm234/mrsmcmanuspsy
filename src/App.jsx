@@ -152,6 +152,22 @@ function useCloudSync() {
   };
   const signOutUser = async () => { if (fb.current) await fb.current.authMod.signOut(fb.current.auth); };
 
+  const changePassword = async (currentPassword, newPassword) => {
+    setAuthBusy(true); setAuthError("");
+    try {
+      const { authMod, auth } = fb.current;
+      const cred = authMod.EmailAuthProvider.credential(auth.currentUser.email, currentPassword);
+      await authMod.reauthenticateWithCredential(auth.currentUser, cred);
+      await authMod.updatePassword(auth.currentUser, newPassword);
+      return true;
+    } catch (e) {
+      setAuthError(e.message.replace("Firebase: ", ""));
+      return false;
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
   const docRef = () => {
     if (!fb.current || !user) return null;
     const { fsMod, db } = fb.current;
@@ -171,7 +187,7 @@ function useCloudSync() {
     try { await fb.current.fsMod.setDoc(ref, data); return true; } catch (e) { return false; }
   };
 
-  return { configured: isFirebaseConfigured(), ready, user, authError, authBusy, signIn, signOutUser, subscribeCloud, pushToCloud };
+  return { configured: isFirebaseConfigured(), ready, user, authError, authBusy, signIn, signOutUser, changePassword, clearAuthError: () => setAuthError(""), subscribeCloud, pushToCloud };
 }
 
 function useStore() {
@@ -433,6 +449,23 @@ export default function App() {
   const addBankEntry = (entry) => setData({ ...data, teamBank: [...teamBank, { id: uid(), ...entry }] });
   const deleteBankEntry = (id) => setData({ ...data, teamBank: teamBank.filter((b) => b.id !== id) });
 
+  // Matches purely by name+role (team members don't share a stable id with bank
+  // entries), so renaming here updates that same person wherever they appear —
+  // the bank entry and every case team that has them.
+  const renamePerson = (oldName, oldRole, newName, newRole) => {
+    const nm = newName.trim();
+    if (!nm || !newRole) return;
+    const matches = (m) => m.name.trim().toLowerCase() === oldName.trim().toLowerCase() && m.role === oldRole;
+    setData({
+      ...data,
+      teamBank: teamBank.map((b) => (matches(b) ? { ...b, name: nm, role: newRole } : b)),
+      students: students.map((s) => ({
+        ...s,
+        team: (s.team || []).map((m) => (matches(m) ? { ...m, name: nm, role: newRole } : m)),
+      })),
+    });
+  };
+
   const editStudent = (sid, patch) => {
     setData({ ...data, students: students.map((s) => (s.id === sid ? { ...s, ...patch } : s)) });
     setShowEditStudent(false);
@@ -615,7 +648,7 @@ export default function App() {
             view === "calendar" ? (
               <CalendarView tasks={tasks} students={students} onOpenStudent={openStudent} studentName={studentName} onToggleTask={toggleTaskDone} />
             ) : view === "bank" ? (
-              <TeamBankView bank={teamBank} roleOptions={roleOptions} students={students} onAdd={addBankEntry} onDelete={deleteBankEntry} onOpenStudent={openStudent} onFilterPerson={(name) => { setPersonFilter(name); goOverview(); }} />
+              <TeamBankView bank={teamBank} roleOptions={roleOptions} students={students} onAdd={addBankEntry} onDelete={deleteBankEntry} onRename={renamePerson} onOpenStudent={openStudent} onFilterPerson={(name) => { setPersonFilter(name); goOverview(); }} />
             ) : view === "settings" ? (
               <SettingsView
                 planTypes={planTypes} roleOptions={roleOptions} students={students} teamBank={teamBank}
@@ -670,7 +703,7 @@ export default function App() {
         <LogEntryModal students={students.filter((s) => !s.archived)} initial={showLog} onCancel={() => setShowLog(null)} onSave={saveEntry}
           onDelete={showLog.editEntry ? () => { deleteEntry(showLog.editEntry.id); setShowLog(null); } : null} />
       )}
-      {showTeamModal && activeStudent && <TeamModal student={activeStudent} bank={teamBank} roleOptions={roleOptions} onCancel={() => setShowTeamModal(false)} onSave={(team) => saveTeam(activeStudent.id, team)} />}
+      {showTeamModal && activeStudent && <TeamModal student={activeStudent} bank={teamBank} roleOptions={roleOptions} onRename={renamePerson} onCancel={() => setShowTeamModal(false)} onSave={(team) => saveTeam(activeStudent.id, team)} />}
       {showEditStudent && activeStudent && <EditStudentModal student={activeStudent} planTypes={planTypes} onCancel={() => setShowEditStudent(false)} onSave={(patch) => editStudent(activeStudent.id, patch)} />}
     </div>
   );
@@ -1189,10 +1222,12 @@ function LogEntryModal({ students, initial, onCancel, onSave, onDelete }) {
   );
 }
 
-function TeamModal({ student, bank, roleOptions, onCancel, onSave }) {
+function TeamModal({ student, bank, roleOptions, onRename, onCancel, onSave }) {
   const [team, setTeam] = useState(student.team || []);
   const [name, setName] = useState(""); const [role, setRole] = useState(roleOptions[0] || "");
   const [bankPick, setBankPick] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState(""); const [editRole, setEditRole] = useState("");
   const onCase = (n, r) => team.some((t) => t.name.trim().toLowerCase() === n.trim().toLowerCase() && t.role === r);
   const bankOptions = (bank || []).filter((b) => !onCase(b.name, b.role));
   const add = () => { if (!name.trim()) return; setTeam([...team, { id: uid(), name: name.trim(), role }]); setName(""); };
@@ -1202,15 +1237,37 @@ function TeamModal({ student, bank, roleOptions, onCancel, onSave }) {
     setTeam([...team, { id: uid(), name: b.name, role: b.role }]);
     setBankPick("");
   };
+  const startEdit = (m) => { setEditingId(m.id); setEditName(m.name); setEditRole(m.role); };
+  const commitEdit = (m) => {
+    const nm = editName.trim();
+    if (!nm) { setEditingId(null); return; }
+    onRename(m.name, m.role, nm, editRole);
+    setTeam(team.map((t) => (t.id === m.id ? { ...t, name: nm, role: editRole } : t)));
+    setEditingId(null);
+  };
   return (
     <ModalShell title={`Team — ${student.name}`} onCancel={onCancel}>
       <div className="flex flex-col gap-2 mb-4">
-        {team.map((m) => (
-          <div key={m.id} className="flex items-center gap-2 p-2 rounded-md" style={{ background: COLORS.paper }}>
-            <div className="flex-1 min-w-0"><div style={{ fontSize: 13.5, fontWeight: 600 }} className="truncate">{m.name}</div><div style={{ fontSize: 11.5, color: COLORS.muted }}>{m.role}</div></div>
-            <button onClick={() => setTeam(team.filter((x) => x.id !== m.id))}><X size={14} color={COLORS.muted} /></button>
-          </div>
-        ))}
+        {team.map((m) => {
+          const editing = editingId === m.id;
+          return editing ? (
+            <div key={m.id} className="p-2 rounded-md flex flex-col gap-1.5" style={{ background: COLORS.paper }}>
+              <input autoFocus style={{ ...inputStyle, padding: "6px 8px" }} value={editName} onChange={(e) => setEditName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && commitEdit(m)} />
+              <select style={{ ...inputStyle, padding: "6px 8px" }} value={editRole} onChange={(e) => setEditRole(e.target.value)}>{roleOptions.map((r) => <option key={r}>{r}</option>)}</select>
+              <div className="flex gap-2">
+                <button onClick={() => commitEdit(m)} className="text-xs font-medium px-2 py-1 rounded" style={{ background: COLORS.navy, color: "#fff" }}>Save</button>
+                <button onClick={() => setEditingId(null)} className="text-xs px-1" style={{ color: COLORS.muted }}>Cancel</button>
+              </div>
+              <div style={{ fontSize: 10.5, color: COLORS.muted }}>Updates this person everywhere they appear, not just this case.</div>
+            </div>
+          ) : (
+            <div key={m.id} className="flex items-center gap-2 p-2 rounded-md" style={{ background: COLORS.paper }}>
+              <div className="flex-1 min-w-0"><div style={{ fontSize: 13.5, fontWeight: 600 }} className="truncate">{m.name}</div><div style={{ fontSize: 11.5, color: COLORS.muted }}>{m.role}</div></div>
+              <button onClick={() => startEdit(m)} title="Edit"><Pencil size={13} color={COLORS.muted} /></button>
+              <button onClick={() => setTeam(team.filter((x) => x.id !== m.id))}><X size={14} color={COLORS.muted} /></button>
+            </div>
+          );
+        })}
         {team.length === 0 && <EmptyNote text="No team members yet." />}
       </div>
 
@@ -1240,8 +1297,10 @@ function TeamModal({ student, bank, roleOptions, onCancel, onSave }) {
 }
 
 /* --------------------------------- Team bank --------------------------------- */
-function TeamBankView({ bank, roleOptions, students, onAdd, onDelete, onFilterPerson }) {
+function TeamBankView({ bank, roleOptions, students, onAdd, onDelete, onRename, onOpenStudent, onFilterPerson }) {
   const [name, setName] = useState(""); const [role, setRole] = useState(roleOptions[0] || "");
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState(""); const [editRole, setEditRole] = useState("");
   const active = students.filter((s) => !s.archived);
 
   const casesFor = (personName) => active.filter((s) => (s.team || []).some((m) => m.name.trim().toLowerCase() === personName.trim().toLowerCase())).map((s) => s.name);
@@ -1259,12 +1318,20 @@ function TeamBankView({ bank, roleOptions, students, onAdd, onDelete, onFilterPe
     setName("");
   };
 
+  const startEdit = (p) => { setEditingId(p.id); setEditName(p.name); setEditRole(p.role); };
+  const commitEdit = (p) => {
+    if (editName.trim()) onRename(p.name, p.role, editName.trim(), editRole);
+    setEditingId(null);
+  };
+
   return (
     <div className="p-6 md:p-8 max-w-4xl">
       <div className="mb-6">
         <h2 style={{ fontFamily: "'Newsreader', serif", fontSize: 26, fontWeight: 600, color: COLORS.navy }}>Team bank</h2>
         <p style={{ color: COLORS.muted, fontSize: 13.5, marginTop: 2 }}>
-          Everyone you've worked with, in one place, ready to pick from next time you assign a case team.
+          Everyone you've worked with, in one place. Add someone here to have them ready to pick from on any case's team —
+          or add them straight from a case's Team tab, which adds them here automatically. Editing a name or role here (or
+          on a case) updates it everywhere that person appears.
         </p>
       </div>
 
@@ -1282,15 +1349,32 @@ function TeamBankView({ bank, roleOptions, students, onAdd, onDelete, onFilterPe
             <div className="grid sm:grid-cols-2 gap-2">
               {people.map((p) => {
                 const cases = casesFor(p.name);
+                const editing = editingId === p.id;
                 return (
-                  <div key={p.id} className="p-3 rounded-lg flex items-start justify-between gap-2" style={{ background: COLORS.paper, border: `1px solid ${COLORS.line}` }}>
-                    <button onClick={() => cases.length && onFilterPerson(p.name)} className="text-left min-w-0">
-                      <div style={{ fontSize: 14, fontWeight: 600 }}>{p.name}</div>
-                      <div style={{ fontSize: 11.5, color: COLORS.muted }} className="truncate">
-                        {cases.length ? `${cases.length} case${cases.length === 1 ? "" : "s"}: ${cases.join(", ")}` : "Not on any active case yet"}
+                  <div key={p.id} className="p-3 rounded-lg flex flex-col gap-2" style={{ background: COLORS.paper, border: `1px solid ${COLORS.line}` }}>
+                    {editing ? (
+                      <>
+                        <input autoFocus style={{ ...inputStyle, padding: "6px 8px" }} value={editName} onChange={(e) => setEditName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && commitEdit(p)} />
+                        <select style={{ ...inputStyle, padding: "6px 8px" }} value={editRole} onChange={(e) => setEditRole(e.target.value)}>{roleOptions.map((r) => <option key={r}>{r}</option>)}</select>
+                        <div className="flex gap-2">
+                          <button onClick={() => commitEdit(p)} className="text-xs font-medium px-2 py-1 rounded" style={{ background: COLORS.navy, color: "#fff" }}>Save</button>
+                          <button onClick={() => setEditingId(null)} className="text-xs px-1" style={{ color: COLORS.muted }}>Cancel</button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="flex items-start justify-between gap-2">
+                        <button onClick={() => cases.length && onFilterPerson(p.name)} className="text-left min-w-0">
+                          <div style={{ fontSize: 14, fontWeight: 600 }}>{p.name}</div>
+                          <div style={{ fontSize: 11.5, color: COLORS.muted }} className="truncate">
+                            {cases.length ? `${cases.length} case${cases.length === 1 ? "" : "s"}: ${cases.join(", ")}` : "Not on any active case yet"}
+                          </div>
+                        </button>
+                        <div className="flex gap-1 flex-shrink-0">
+                          <button onClick={() => startEdit(p)} title="Edit"><Pencil size={13} color={COLORS.muted} /></button>
+                          <button onClick={() => onDelete(p.id)} title="Remove from bank"><Trash2 size={13} color={COLORS.muted} /></button>
+                        </div>
                       </div>
-                    </button>
-                    <button onClick={() => onDelete(p.id)} title="Remove from bank" className="flex-shrink-0"><Trash2 size={13} color={COLORS.muted} /></button>
+                    )}
                   </div>
                 );
               })}
@@ -1386,6 +1470,53 @@ function SettingsView({ planTypes, roleOptions, students, teamBank, onAddPlanTyp
 }
 
 /* --------------------------------- Sync & backup --------------------------------- */
+function ChangePasswordForm({ cloud }) {
+  const [open, setOpen] = useState(false);
+  const [current, setCurrent] = useState(""); const [next, setNext] = useState(""); const [confirmNext, setConfirmNext] = useState("");
+  const [success, setSuccess] = useState(false);
+  const mismatch = next && confirmNext && next !== confirmNext;
+  const canSubmit = current && next.length >= 6 && next === confirmNext;
+
+  const toggle = () => {
+    cloud.clearAuthError();
+    setSuccess(false); setCurrent(""); setNext(""); setConfirmNext("");
+    setOpen(!open);
+  };
+
+  const submit = async () => {
+    const ok = await cloud.changePassword(current, next);
+    if (ok) { setSuccess(true); setCurrent(""); setNext(""); setConfirmNext(""); }
+  };
+
+  if (!open) {
+    return <button onClick={toggle} className="self-start text-xs px-3 py-1.5 rounded-md" style={{ border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft }}>Change password</button>;
+  }
+
+  return (
+    <div className="p-3 rounded-lg flex flex-col gap-2 max-w-sm" style={{ background: COLORS.paper, border: `1px solid ${COLORS.line}` }}>
+      <div className="flex items-center justify-between">
+        <div style={{ fontSize: 13, fontWeight: 600 }}>Change password</div>
+        <button onClick={toggle}><X size={14} color={COLORS.muted} /></button>
+      </div>
+      {success ? (
+        <div style={{ fontSize: 12.5, color: COLORS.navy }}>Password updated.</div>
+      ) : (
+        <>
+          <Field label="Current password"><input type="password" style={inputStyle} value={current} onChange={(e) => setCurrent(e.target.value)} /></Field>
+          <Field label="New password"><input type="password" style={inputStyle} value={next} onChange={(e) => setNext(e.target.value)} /></Field>
+          <Field label="Confirm new password"><input type="password" style={inputStyle} value={confirmNext} onChange={(e) => setConfirmNext(e.target.value)} /></Field>
+          {mismatch && <div style={{ color: COLORS.red, fontSize: 11.5 }}>Passwords don't match.</div>}
+          {next && next.length < 6 && <div style={{ color: COLORS.red, fontSize: 11.5 }}>At least 6 characters.</div>}
+          {cloud.authError && <div style={{ color: COLORS.red, fontSize: 11.5 }}>{cloud.authError}</div>}
+          <button disabled={!canSubmit || cloud.authBusy} onClick={submit} className="py-1.5 rounded-md text-xs font-medium disabled:opacity-40" style={{ background: COLORS.navy, color: "#fff" }}>
+            Update password
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
 function SyncBackupView({ cloud, syncStatus, data, onImportLocalToCloud, onStartFreshInCloud, onImportDataToCloud, onRestoreBackup, onLoadSampleData, onClearAllData }) {
   const [mode, setMode] = useState("signin"); // signin | create
   const [email, setEmail] = useState(""); const [password, setPassword] = useState("");
@@ -1506,6 +1637,7 @@ function SyncBackupView({ cloud, syncStatus, data, onImportLocalToCloud, onStart
               )}
               {seedError && <div style={{ color: COLORS.red, fontSize: 12 }}>{seedError}</div>}
               {syncStatus === "synced" && <div style={{ fontSize: 12.5, color: COLORS.muted }}>Sign into this same account on another device to keep both up to date automatically.</div>}
+              <ChangePasswordForm cloud={cloud} />
               <button onClick={cloud.signOutUser} className="self-start flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md" style={{ border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft }}>
                 <LogOut size={13} /> Sign out
               </button>
