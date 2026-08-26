@@ -466,6 +466,19 @@ export default function App() {
     });
   };
 
+  // One-time sweep for people already on a case's team from before the bank
+  // existed — pulls anyone missing into it without needing to re-save each case.
+  const syncAllTeamsToBank = () => {
+    const existingKeys = new Set(teamBank.map((b) => bankKey(b.name, b.role)));
+    const additions = [];
+    students.forEach((s) => (s.team || []).forEach((m) => {
+      const k = bankKey(m.name, m.role);
+      if (!existingKeys.has(k)) { existingKeys.add(k); additions.push({ id: uid(), name: m.name.trim(), role: m.role }); }
+    }));
+    if (additions.length) setData({ ...data, teamBank: [...teamBank, ...additions] });
+    return additions.length;
+  };
+
   const editStudent = (sid, patch) => {
     setData({ ...data, students: students.map((s) => (s.id === sid ? { ...s, ...patch } : s)) });
     setShowEditStudent(false);
@@ -648,7 +661,7 @@ export default function App() {
             view === "calendar" ? (
               <CalendarView tasks={tasks} students={students} onOpenStudent={openStudent} studentName={studentName} onToggleTask={toggleTaskDone} />
             ) : view === "bank" ? (
-              <TeamBankView bank={teamBank} roleOptions={roleOptions} students={students} onAdd={addBankEntry} onDelete={deleteBankEntry} onRename={renamePerson} onOpenStudent={openStudent} onFilterPerson={(name) => { setPersonFilter(name); goOverview(); }} />
+              <TeamBankView bank={teamBank} roleOptions={roleOptions} students={students} onAdd={addBankEntry} onDelete={deleteBankEntry} onRename={renamePerson} onSyncExisting={syncAllTeamsToBank} onOpenStudent={openStudent} onFilterPerson={(name) => { setPersonFilter(name); goOverview(); }} />
             ) : view === "settings" ? (
               <SettingsView
                 planTypes={planTypes} roleOptions={roleOptions} students={students} teamBank={teamBank}
@@ -1297,10 +1310,11 @@ function TeamModal({ student, bank, roleOptions, onRename, onCancel, onSave }) {
 }
 
 /* --------------------------------- Team bank --------------------------------- */
-function TeamBankView({ bank, roleOptions, students, onAdd, onDelete, onRename, onOpenStudent, onFilterPerson }) {
+function TeamBankView({ bank, roleOptions, students, onAdd, onDelete, onRename, onSyncExisting, onOpenStudent, onFilterPerson }) {
   const [name, setName] = useState(""); const [role, setRole] = useState(roleOptions[0] || "");
   const [editingId, setEditingId] = useState(null);
   const [editName, setEditName] = useState(""); const [editRole, setEditRole] = useState("");
+  const [syncMsg, setSyncMsg] = useState("");
   const active = students.filter((s) => !s.archived);
 
   const casesFor = (personName) => active.filter((s) => (s.team || []).some((m) => m.name.trim().toLowerCase() === personName.trim().toLowerCase())).map((s) => s.name);
@@ -1333,6 +1347,15 @@ function TeamBankView({ bank, roleOptions, students, onAdd, onDelete, onRename, 
           or add them straight from a case's Team tab, which adds them here automatically. Editing a name or role here (or
           on a case) updates it everywhere that person appears.
         </p>
+        {onSyncExisting && (
+          <div className="mt-3 flex items-center gap-2 flex-wrap">
+            <button onClick={() => { const n = onSyncExisting(); setSyncMsg(n > 0 ? `Added ${n} ${n === 1 ? "person" : "people"} already on a case.` : "Everyone already on a case is already in the bank."); }}
+              className="text-xs px-3 py-1.5 rounded-md font-medium" style={{ border: `1px solid ${COLORS.navy}`, color: COLORS.navy }}>
+              Pull in everyone already on a case
+            </button>
+            {syncMsg && <span style={{ fontSize: 12, color: COLORS.muted }}>{syncMsg}</span>}
+          </div>
+        )}
       </div>
 
       <Panel title="Add someone new">
