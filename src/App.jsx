@@ -1,9 +1,11 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   Search, Plus, X, Clock, CalendarClock, FolderOpen, AlertCircle, CheckCircle2, Circle,
   Trash2, ArrowLeft, ClipboardList, UserPlus, Archive, ArchiveRestore, ListChecks, Users2,
-  CalendarDays, ChevronLeft, ChevronRight, Filter, User,
+  CalendarDays, ChevronLeft, ChevronRight, Filter, User, Pencil, Settings, Cloud, CloudOff,
+  Download, Upload, LogOut,
 } from "lucide-react";
+import { firebaseConfig, isFirebaseConfigured } from "./firebaseConfig";
 
 /* ---------------------------------- tokens --------------------------------- */
 /* Hudson City Schools palette: navy blue + white, with a muted gold used sparingly
@@ -43,17 +45,18 @@ const ACTIVITY_TYPES = [
 ];
 const activityById = Object.fromEntries(ACTIVITY_TYPES.map((a) => [a.id, a]));
 
-const PLAN_TYPES = ["IEP", "504 Plan", "RTI / MTSS", "Evaluation in Progress", "Consultation Only"];
+const DEFAULT_PLAN_TYPES = ["IEP", "504 Plan", "ETR", "RETR", "RTI / MTSS", "Evaluation in Progress", "Consultation Only"];
 const DISABILITY_CATEGORIES = [
   "Not yet identified", "Autism", "Deaf-Blindness", "Deafness", "Emotional Disturbance",
   "Hearing Impairment", "Intellectual Disability", "Multiple Disabilities", "Orthopedic Impairment",
   "Other Health Impairment", "Specific Learning Disability", "Speech or Language Impairment",
   "Traumatic Brain Injury", "Visual Impairment", "Developmental Delay", "N/A — 504 only", "N/A — MTSS/RTI only",
 ];
-const ROLE_OPTIONS = [
+const DEFAULT_ROLE_OPTIONS = [
   "Special Education Teacher", "General Education Teacher", "Intervention Specialist",
   "Speech-Language Pathologist (SLP)", "Occupational Therapist (OT)", "Physical Therapist (PT)",
-  "School Counselor", "Social Worker", "District Representative", "Administrator",
+  "Teacher of the Deaf (TOD)", "Teacher of the Visually Impaired (TVI)", "Educational Audiologist (Ed. Aud.)",
+  "Behavior Specialist", "School Counselor", "Social Worker", "District Representative", "Administrator",
   "Parent / Guardian", "Other",
 ];
 
@@ -101,41 +104,154 @@ const urgencyRank = { overdue: 0, soon: 1, upcoming: 2, none: 3, done: 4 };
    server involved. Swap this hook out if Lindsay ever wants it synced across
    devices (that would need a real backend). */
 const STORAGE_KEY = "caseload-store-v3";
-const EMPTY = { students: [], tasks: [], entries: [] };
+const EMPTY = { students: [], tasks: [], entries: [], teamBank: [], planTypes: [...DEFAULT_PLAN_TYPES], roleOptions: [...DEFAULT_ROLE_OPTIONS] };
+
+/* --------------------------------- cloud sync -------------------------------- */
+/* Sync is entirely optional and inactive until firebaseConfig.js has real values
+   and someone signs in. Until then this behaves exactly like plain localStorage —
+   nothing about the existing local-only behavior changes. Local storage is always
+   kept as the fast/offline copy; Firestore (when signed in) is the cross-device copy. */
+function useCloudSync() {
+  const [ready, setReady] = useState(false);
+  const [user, setUser] = useState(null);
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const fb = useRef(null);
+
+  useEffect(() => {
+    if (!isFirebaseConfigured()) { setReady(true); return; }
+    (async () => {
+      try {
+        const [{ initializeApp }, authMod, fsMod] = await Promise.all([
+          import("firebase/app"),
+          import("firebase/auth"),
+          import("firebase/firestore"),
+        ]);
+        const app = initializeApp(firebaseConfig);
+        const auth = authMod.getAuth(app);
+        const db = fsMod.getFirestore(app);
+        fb.current = { authMod, fsMod, auth, db };
+        authMod.onAuthStateChanged(auth, (u) => { setUser(u); setReady(true); });
+      } catch (e) {
+        setReady(true);
+      }
+    })();
+  }, []);
+
+  const signIn = async (email, password, mode) => {
+    setAuthBusy(true); setAuthError("");
+    try {
+      const { authMod, auth } = fb.current;
+      if (mode === "create") await authMod.createUserWithEmailAndPassword(auth, email, password);
+      else await authMod.signInWithEmailAndPassword(auth, email, password);
+    } catch (e) {
+      setAuthError(e.message.replace("Firebase: ", ""));
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+  const signOutUser = async () => { if (fb.current) await fb.current.authMod.signOut(fb.current.auth); };
+
+  const docRef = () => {
+    if (!fb.current || !user) return null;
+    const { fsMod, db } = fb.current;
+    return fsMod.doc(db, "users", user.uid, "app", "data");
+  };
+
+  const subscribeCloud = (onChange) => {
+    const ref = docRef();
+    if (!ref) return () => {};
+    const { fsMod } = fb.current;
+    return fsMod.onSnapshot(ref, (snap) => onChange(snap.exists() ? snap.data() : null), () => {});
+  };
+
+  const pushToCloud = async (data) => {
+    const ref = docRef();
+    if (!ref) return false;
+    try { await fb.current.fsMod.setDoc(ref, data); return true; } catch (e) { return false; }
+  };
+
+  return { configured: isFirebaseConfigured(), ready, user, authError, authBusy, signIn, signOutUser, subscribeCloud, pushToCloud };
+}
 
 function useStore() {
   const [data, setData] = useState(EMPTY);
   const [loaded, setLoaded] = useState(false);
   const [saveError, setSaveError] = useState(false);
+  const [syncStatus, setSyncStatus] = useState("local"); // local | synced | needs-import
+  const cloud = useCloudSync();
+  const cloudUnsub = useRef(null);
 
-  useEffect(() => {
+  const readLocal = () => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        setData({ ...EMPTY, ...JSON.parse(raw) });
-      } else {
-        const seeded = buildSampleData();
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(seeded));
-        setData(seeded);
-      }
-    } catch (e) {
-      setSaveError(true);
-    } finally {
-      setLoaded(true);
-    }
+      return raw ? { ...EMPTY, ...JSON.parse(raw) } : null;
+    } catch (e) { return null; }
+  };
+  const writeLocal = (next) => {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch (e) { /* ignore */ }
+  };
+
+  useEffect(() => {
+    const existing = readLocal();
+    if (existing) setData(existing);
+    else { const seeded = buildSampleData(); writeLocal(seeded); setData(seeded); }
+    setLoaded(true);
   }, []);
+
+  // When signed in, subscribe to the cloud copy and reconcile with local.
+  useEffect(() => {
+    if (cloudUnsub.current) { cloudUnsub.current(); cloudUnsub.current = null; }
+    if (!cloud.ready || !cloud.user) { setSyncStatus(cloud.configured ? "local" : "local"); return; }
+
+    cloudUnsub.current = cloud.subscribeCloud((remote) => {
+      if (remote) {
+        const merged = { ...EMPTY, ...remote };
+        setData(merged);
+        writeLocal(merged);
+        setSyncStatus("synced");
+      } else {
+        // First time on this account: nothing in the cloud yet.
+        setSyncStatus("needs-import");
+      }
+    });
+    return () => { if (cloudUnsub.current) cloudUnsub.current(); };
+  }, [cloud.ready, cloud.user]);
 
   const persist = useCallback((next) => {
     setData(next);
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-      setSaveError(false);
-    } catch (e) {
-      setSaveError(true);
+    writeLocal(next);
+    if (cloud.user) {
+      cloud.pushToCloud(next).then((ok) => setSaveError(!ok));
     }
-  }, []);
+  }, [cloud.user]);
 
-  return { data, setData: persist, loaded, saveError };
+  const importLocalToCloud = useCallback(async () => {
+    const ok = await cloud.pushToCloud(data);
+    if (ok) setSyncStatus("synced");
+    return ok;
+  }, [cloud, data]);
+
+  const startFreshInCloud = useCallback(async () => {
+    const ok = await cloud.pushToCloud(EMPTY);
+    if (ok) setSyncStatus("synced");
+    return ok;
+  }, [cloud]);
+
+  // Loads an external backup (pasted text or an uploaded file) as the starting
+  // point for a fresh account — for setting up a second device from a copy of
+  // the first device's data, rather than whatever happens to be on this one.
+  const importDataToCloud = useCallback(async (parsed) => {
+    const merged = { ...EMPTY, ...parsed };
+    const ok = await cloud.pushToCloud(merged);
+    if (ok) setSyncStatus("synced");
+    return ok;
+  }, [cloud]);
+
+  return {
+    data, setData: persist, loaded, saveError,
+    cloud, syncStatus, importLocalToCloud, startFreshInCloud, importDataToCloud,
+  };
 }
 
 /* ------------------------------- sample data -------------------------------- */
@@ -192,12 +308,19 @@ function buildSampleData() {
     { id: uid(), studentId: noah.id, date: d(-3), type: "consult", minutes: 15, notes: "MTSS data review with intervention specialist.", createdAt: Date.now() },
   ];
 
-  return { students, tasks, entries };
+  const teamBank = [];
+  const seen = new Set();
+  students.forEach((st) => (st.team || []).forEach((m) => {
+    const key = m.name.trim().toLowerCase() + "|" + m.role;
+    if (!seen.has(key)) { seen.add(key); teamBank.push({ id: uid(), name: m.name, role: m.role }); }
+  }));
+
+  return { students, tasks, entries, teamBank, planTypes: [...DEFAULT_PLAN_TYPES], roleOptions: [...DEFAULT_ROLE_OPTIONS] };
 }
 
 /* ---------------------------------- app ------------------------------------ */
 export default function App() {
-  const { data, setData, loaded, saveError } = useStore();
+  const { data, setData, loaded, saveError, cloud, syncStatus, importLocalToCloud, startFreshInCloud, importDataToCloud } = useStore();
   const [activeId, setActiveId] = useState(null);
   const [view, setView] = useState("overview"); // overview | calendar (only used when activeId is null)
   const [tab, setTab] = useState("overview");
@@ -210,8 +333,11 @@ export default function App() {
   const [showTask, setShowTask] = useState(null);
   const [showLog, setShowLog] = useState(null);
   const [showTeamModal, setShowTeamModal] = useState(false);
+  const [showEditStudent, setShowEditStudent] = useState(false);
 
-  const students = data.students, tasks = data.tasks, entries = data.entries;
+  const students = data.students, tasks = data.tasks, entries = data.entries, teamBank = data.teamBank || [];
+  const planTypes = data.planTypes || DEFAULT_PLAN_TYPES;
+  const roleOptions = data.roleOptions || DEFAULT_ROLE_OPTIONS;
 
   const totalsByStudent = useMemo(() => {
     const map = {};
@@ -289,16 +415,62 @@ export default function App() {
     setShowLog(null);
   };
   const deleteEntry = (id) => setData({ ...data, entries: entries.filter((e) => e.id !== id) });
+
+  const bankKey = (name, role) => name.trim().toLowerCase() + "|" + role;
+  const mergeIntoBank = (team) => {
+    const existingKeys = new Set(teamBank.map((b) => bankKey(b.name, b.role)));
+    const additions = [];
+    team.forEach((m) => {
+      const k = bankKey(m.name, m.role);
+      if (!existingKeys.has(k)) { existingKeys.add(k); additions.push({ id: uid(), name: m.name.trim(), role: m.role }); }
+    });
+    return additions.length ? [...teamBank, ...additions] : teamBank;
+  };
   const saveTeam = (sid, team) => {
-    setData({ ...data, students: students.map((s) => (s.id === sid ? { ...s, team } : s)) });
+    setData({ ...data, students: students.map((s) => (s.id === sid ? { ...s, team } : s)), teamBank: mergeIntoBank(team) });
     setShowTeamModal(false);
   };
+  const addBankEntry = (entry) => setData({ ...data, teamBank: [...teamBank, { id: uid(), ...entry }] });
+  const deleteBankEntry = (id) => setData({ ...data, teamBank: teamBank.filter((b) => b.id !== id) });
+
+  const editStudent = (sid, patch) => {
+    setData({ ...data, students: students.map((s) => (s.id === sid ? { ...s, ...patch } : s)) });
+    setShowEditStudent(false);
+  };
+
+  const norm = (s) => s.trim().toLowerCase();
+  const addPlanType = (val) => { const v = val.trim(); if (!v || planTypes.some((p) => norm(p) === norm(v))) return; setData({ ...data, planTypes: [...planTypes, v] }); };
+  const renamePlanType = (oldVal, newVal) => {
+    const v = newVal.trim(); if (!v) return;
+    setData({
+      ...data,
+      planTypes: planTypes.map((p) => (p === oldVal ? v : p)),
+      students: students.map((s) => (s.planType === oldVal ? { ...s, planType: v } : s)),
+    });
+  };
+  const deletePlanType = (val) => setData({ ...data, planTypes: planTypes.filter((p) => p !== val) });
+
+  const addRole = (val) => { const v = val.trim(); if (!v || roleOptions.some((r) => norm(r) === norm(v))) return; setData({ ...data, roleOptions: [...roleOptions, v] }); };
+  const renameRole = (oldVal, newVal) => {
+    const v = newVal.trim(); if (!v) return;
+    setData({
+      ...data,
+      roleOptions: roleOptions.map((r) => (r === oldVal ? v : r)),
+      students: students.map((s) => ({ ...s, team: (s.team || []).map((m) => (m.role === oldVal ? { ...m, role: v } : m)) })),
+      teamBank: teamBank.map((b) => (b.role === oldVal ? { ...b, role: v } : b)),
+    });
+  };
+  const deleteRole = (val) => setData({ ...data, roleOptions: roleOptions.filter((r) => r !== val) });
+
   const loadSampleData = () => { if (confirm("Replace everything currently loaded with fresh sample data?")) setData(buildSampleData()); };
   const clearAllData = () => { if (confirm("Clear all cases, tasks, and logged time? This can't be undone.")) setData(EMPTY); };
 
   const openStudent = (id) => { setActiveId(id); setTab("overview"); };
   const goOverview = () => { setActiveId(null); setView("overview"); };
   const goCalendar = () => { setActiveId(null); setView("calendar"); };
+  const goBank = () => { setActiveId(null); setView("bank"); };
+  const goSettings = () => { setActiveId(null); setView("settings"); };
+  const goSync = () => { setActiveId(null); setView("sync"); };
 
   if (!loaded) {
     return <div style={{ background: COLORS.paper, minHeight: "100vh" }} className="flex items-center justify-center">
@@ -313,9 +485,9 @@ export default function App() {
         Changes aren't saving right now — keep working, but avoid closing this tab.
       </div>}
 
-      <div className="flex flex-col md:flex-row" style={{ minHeight: "100vh" }}>
+      <div className="flex flex-col md:flex-row md:h-screen md:overflow-hidden" style={{ minHeight: "100vh" }}>
         {/* ---------------- Sidebar (Hudson navy) ---------------- */}
-        <div className="md:w-80 w-full flex-shrink-0 flex flex-col" style={{ background: COLORS.navyDeep }}>
+        <div className="md:w-80 w-full flex-shrink-0 flex flex-col md:h-full md:overflow-hidden md:min-h-0" style={{ background: COLORS.navyDeep }}>
           <div className="px-5 pt-6 pb-4 flex items-center gap-3" style={{ borderBottom: `1px solid ${COLORS.navyLine}` }}>
             <img src={`data:image/jpeg;base64,${AVATAR_B64}`} alt={OWNER.name} className="w-11 h-11 rounded-full flex-shrink-0 object-cover" style={{ border: `2px solid ${COLORS.gold}` }} />
             <div className="min-w-0">
@@ -326,6 +498,13 @@ export default function App() {
               <div style={{ color: COLORS.onNavyMuted, fontSize: 11 }}>{visibleStudents.length} of {students.filter((s) => !s.archived).length} active cases</div>
             </div>
           </div>
+          <button onClick={goSync} className="mx-5 mt-3 mb-1 px-2.5 py-1.5 rounded-md flex items-center gap-1.5 text-left"
+            style={{ background: syncStatus === "synced" ? "rgba(184,146,63,0.15)" : "rgba(255,255,255,0.06)", border: `1px solid ${syncStatus === "synced" ? COLORS.gold : COLORS.navyLine}` }}>
+            {syncStatus === "synced" ? <Cloud size={13} color={COLORS.gold} /> : <CloudOff size={13} color={COLORS.onNavyMuted} />}
+            <span style={{ fontSize: 11, fontWeight: 600, color: syncStatus === "synced" ? COLORS.gold : COLORS.onNavyMuted }}>
+              {syncStatus === "synced" ? `Account: ${cloud.user?.email || ""}` : "No account — data stays on this device only"}
+            </span>
+          </button>
 
           <div className="px-4 pt-3 pb-2 flex flex-col gap-2" style={{ borderBottom: `1px solid ${COLORS.navyLine}` }}>
             <div className="relative">
@@ -361,7 +540,7 @@ export default function App() {
             )}
           </div>
 
-          <div className="flex-1 overflow-y-auto">
+          <div className="flex-1 overflow-y-auto min-h-0">
             <button onClick={goOverview} className="w-full text-left px-5 py-3 flex items-center gap-2"
               style={{ background: activeId === null && view === "overview" ? COLORS.navyMid : "transparent", borderBottom: `1px solid ${COLORS.navyLine}` }}>
               <ClipboardList size={16} color={COLORS.gold} />
@@ -372,6 +551,26 @@ export default function App() {
               style={{ background: activeId === null && view === "calendar" ? COLORS.navyMid : "transparent", borderBottom: `1px solid ${COLORS.navyLine}` }}>
               <CalendarDays size={16} color={COLORS.gold} />
               <span style={{ fontSize: 13.5, fontWeight: 600, color: "#fff" }}>Calendar</span>
+            </button>
+            <button onClick={goBank} className="w-full text-left px-5 py-3 flex items-center gap-2"
+              style={{ background: activeId === null && view === "bank" ? COLORS.navyMid : "transparent", borderBottom: `1px solid ${COLORS.navyLine}` }}>
+              <Users2 size={16} color={COLORS.gold} />
+              <span style={{ fontSize: 13.5, fontWeight: 600, color: "#fff" }}>Team bank</span>
+            </button>
+            <button onClick={goSettings} className="w-full text-left px-5 py-3 flex items-center gap-2"
+              style={{ background: activeId === null && view === "settings" ? COLORS.navyMid : "transparent", borderBottom: `1px solid ${COLORS.navyLine}` }}>
+              <Settings size={16} color={COLORS.gold} />
+              <span style={{ fontSize: 13.5, fontWeight: 600, color: "#fff" }}>Settings</span>
+            </button>
+            <button onClick={goSync} className="w-full text-left px-5 py-3 flex items-center gap-2"
+              style={{ background: activeId === null && view === "sync" ? COLORS.navyMid : "transparent", borderBottom: `1px solid ${COLORS.navyLine}` }}>
+              {syncStatus === "synced" ? <Cloud size={16} color={COLORS.gold} /> : <CloudOff size={16} color={COLORS.onNavyMuted} />}
+              <div className="min-w-0">
+                <div style={{ fontSize: 13.5, fontWeight: 600, color: "#fff" }}>Account &amp; sync</div>
+                <div style={{ fontSize: 10.5, color: syncStatus === "synced" ? COLORS.gold : COLORS.onNavyMuted }} className="truncate">
+                  {syncStatus === "synced" ? cloud.user?.email : "Not signed in"}
+                </div>
+              </div>
             </button>
 
             {visibleStudents.length === 0 && <div className="px-5 py-8 text-center" style={{ color: COLORS.onNavyMuted, fontSize: 13 }}>No students match. Add one to get started.</div>}
@@ -402,27 +601,34 @@ export default function App() {
             })}
           </div>
 
-          <div className="p-4 flex flex-col gap-2" style={{ borderTop: `1px solid ${COLORS.navyLine}` }}>
+          <div className="p-4" style={{ borderTop: `1px solid ${COLORS.navyLine}` }}>
             <button onClick={() => setShowAddStudent(true)} className="w-full py-2.5 rounded-md flex items-center justify-center gap-1.5 text-sm font-medium hover:opacity-90"
               style={{ background: COLORS.gold, color: COLORS.navyDeep, fontWeight: 700 }}>
               <Plus size={16} /> New case
             </button>
-            <div className="flex gap-2">
-              <button onClick={loadSampleData} className="flex-1 py-1.5 rounded-md text-xs" style={{ border: `1px solid ${COLORS.navyLine}`, color: COLORS.onNavyMuted }}>
-                Reset sample data
-              </button>
-              <button onClick={clearAllData} className="flex-1 py-1.5 rounded-md text-xs" style={{ border: `1px solid ${COLORS.navyLine}`, color: COLORS.onNavyMuted }}>
-                Clear all data
-              </button>
-            </div>
           </div>
         </div>
 
         {/* ---------------- Main panel ---------------- */}
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0 md:h-full md:overflow-y-auto md:min-h-0">
           {activeId === null ? (
             view === "calendar" ? (
               <CalendarView tasks={tasks} students={students} onOpenStudent={openStudent} studentName={studentName} onToggleTask={toggleTaskDone} />
+            ) : view === "bank" ? (
+              <TeamBankView bank={teamBank} roleOptions={roleOptions} students={students} onAdd={addBankEntry} onDelete={deleteBankEntry} onOpenStudent={openStudent} onFilterPerson={(name) => { setPersonFilter(name); goOverview(); }} />
+            ) : view === "settings" ? (
+              <SettingsView
+                planTypes={planTypes} roleOptions={roleOptions} students={students} teamBank={teamBank}
+                onAddPlanType={addPlanType} onRenamePlanType={renamePlanType} onDeletePlanType={deletePlanType}
+                onAddRole={addRole} onRenameRole={renameRole} onDeleteRole={deleteRole}
+              />
+            ) : view === "sync" ? (
+              <SyncBackupView
+                cloud={cloud} syncStatus={syncStatus} data={data} onImportLocalToCloud={importLocalToCloud} onStartFreshInCloud={startFreshInCloud}
+                onImportDataToCloud={importDataToCloud}
+                onRestoreBackup={(restored) => setData({ ...EMPTY, ...restored })}
+                onLoadSampleData={loadSampleData} onClearAllData={clearAllData}
+              />
             ) : (
               <CaseloadOverview
                 students={students} tasks={tasks} onOpenStudent={openStudent}
@@ -440,6 +646,7 @@ export default function App() {
               totalMinutes={totalsByStudent[activeId] || 0}
               tab={tab} setTab={setTab}
               onBack={goOverview}
+              onEdit={() => setShowEditStudent(true)}
               onNewTask={() => setShowTask({ studentId: activeId })}
               onEditTask={(t) => setShowTask({ studentId: activeId, editTask: t })}
               onDeleteTask={deleteTask} onToggleTask={toggleTaskDone}
@@ -454,7 +661,7 @@ export default function App() {
         </div>
       </div>
 
-      {showAddStudent && <AddStudentModal onCancel={() => setShowAddStudent(false)} onSave={addStudent} />}
+      {showAddStudent && <AddStudentModal planTypes={planTypes} onCancel={() => setShowAddStudent(false)} onSave={addStudent} />}
       {showTask && (
         <TaskModal students={students.filter((s) => !s.archived)} initial={showTask} onCancel={() => setShowTask(null)} onSave={saveTask}
           onDelete={showTask.editTask ? () => { deleteTask(showTask.editTask.id); setShowTask(null); } : null} />
@@ -463,7 +670,8 @@ export default function App() {
         <LogEntryModal students={students.filter((s) => !s.archived)} initial={showLog} onCancel={() => setShowLog(null)} onSave={saveEntry}
           onDelete={showLog.editEntry ? () => { deleteEntry(showLog.editEntry.id); setShowLog(null); } : null} />
       )}
-      {showTeamModal && activeStudent && <TeamModal student={activeStudent} onCancel={() => setShowTeamModal(false)} onSave={(team) => saveTeam(activeStudent.id, team)} />}
+      {showTeamModal && activeStudent && <TeamModal student={activeStudent} bank={teamBank} roleOptions={roleOptions} onCancel={() => setShowTeamModal(false)} onSave={(team) => saveTeam(activeStudent.id, team)} />}
+      {showEditStudent && activeStudent && <EditStudentModal student={activeStudent} planTypes={planTypes} onCancel={() => setShowEditStudent(false)} onSave={(patch) => editStudent(activeStudent.id, patch)} />}
     </div>
   );
 }
@@ -675,7 +883,7 @@ function CalendarView({ tasks, students, onOpenStudent, studentName, onToggleTas
 }
 
 /* ------------------------------- Student panel ------------------------------ */
-function StudentPanel({ student, tasks, entries, totalMinutes, tab, setTab, onBack, onNewTask, onEditTask, onDeleteTask, onToggleTask, onLog, onEditEntry, onDeleteEntry, onArchive, onDelete, onManageTeam }) {
+function StudentPanel({ student, tasks, entries, totalMinutes, tab, setTab, onBack, onEdit, onNewTask, onEditTask, onDeleteTask, onToggleTask, onLog, onEditEntry, onDeleteEntry, onArchive, onDelete, onManageTeam }) {
   if (!student) return null;
   const openTasks = tasks.filter((t) => t.status !== "done").sort((a, b) => (a.dueDate || "9999").localeCompare(b.dueDate || "9999"));
   const doneTasks = tasks.filter((t) => t.status === "done");
@@ -696,6 +904,7 @@ function StudentPanel({ student, tasks, entries, totalMinutes, tab, setTab, onBa
           </div>
         </div>
         <div className="flex gap-2">
+          <IconButton onClick={onEdit} title="Edit case details"><Pencil size={15} /></IconButton>
           <IconButton onClick={onArchive} title={student.archived ? "Reopen case" : "Close case"}>{student.archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}</IconButton>
           <IconButton onClick={onDelete} title="Delete case" danger><Trash2 size={15} /></IconButton>
         </div>
@@ -891,19 +1100,38 @@ function Field({ label, children }) {
 }
 const inputStyle = { width: "100%", padding: "8px 10px", borderRadius: 8, border: `1px solid ${COLORS.line}`, fontSize: 13.5, outline: "none", fontFamily: "inherit" };
 
-function AddStudentModal({ onCancel, onSave }) {
+function AddStudentModal({ planTypes, onCancel, onSave }) {
   const [name, setName] = useState(""); const [grade, setGrade] = useState("");
-  const [planType, setPlanType] = useState(PLAN_TYPES[0]); const [disabilityCategory, setDisabilityCategory] = useState(DISABILITY_CATEGORIES[0]);
+  const [planType, setPlanType] = useState(planTypes[0] || ""); const [disabilityCategory, setDisabilityCategory] = useState(DISABILITY_CATEGORIES[0]);
   return (
     <ModalShell title="New case" onCancel={onCancel}>
       <Field label="Student name"><input autoFocus style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Jordan Reyes" /></Field>
       <Field label="Grade"><input style={inputStyle} value={grade} onChange={(e) => setGrade(e.target.value)} placeholder="e.g. 3rd grade" /></Field>
-      <Field label="Plan type"><select style={inputStyle} value={planType} onChange={(e) => setPlanType(e.target.value)}>{PLAN_TYPES.map((o) => <option key={o}>{o}</option>)}</select></Field>
+      <Field label="Plan type"><select style={inputStyle} value={planType} onChange={(e) => setPlanType(e.target.value)}>{planTypes.map((o) => <option key={o}>{o}</option>)}</select></Field>
       <Field label="Disability category (optional)"><select style={inputStyle} value={disabilityCategory} onChange={(e) => setDisabilityCategory(e.target.value)}>{DISABILITY_CATEGORIES.map((o) => <option key={o}>{o}</option>)}</select></Field>
       <div className="flex gap-2 mt-5">
         <button onClick={onCancel} className="flex-1 py-2 rounded-md text-sm" style={{ border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft }}>Cancel</button>
         <button onClick={() => name.trim() && onSave({ name: name.trim(), grade: grade.trim(), planType, disabilityCategory })} disabled={!name.trim()}
           className="flex-1 py-2 rounded-md text-sm font-medium disabled:opacity-40" style={{ background: COLORS.navy, color: "#fff" }}>Add case</button>
+      </div>
+    </ModalShell>
+  );
+}
+
+function EditStudentModal({ student, planTypes, onCancel, onSave }) {
+  const [name, setName] = useState(student.name); const [grade, setGrade] = useState(student.grade || "");
+  const [planType, setPlanType] = useState(student.planType || planTypes[0] || "");
+  const [disabilityCategory, setDisabilityCategory] = useState(student.disabilityCategory || DISABILITY_CATEGORIES[0]);
+  return (
+    <ModalShell title="Edit case details" onCancel={onCancel}>
+      <Field label="Student name"><input autoFocus style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} /></Field>
+      <Field label="Grade"><input style={inputStyle} value={grade} onChange={(e) => setGrade(e.target.value)} placeholder="e.g. 3rd grade" /></Field>
+      <Field label="Plan type"><select style={inputStyle} value={planType} onChange={(e) => setPlanType(e.target.value)}>{planTypes.map((o) => <option key={o}>{o}</option>)}</select></Field>
+      <Field label="Disability category"><select style={inputStyle} value={disabilityCategory} onChange={(e) => setDisabilityCategory(e.target.value)}>{DISABILITY_CATEGORIES.map((o) => <option key={o}>{o}</option>)}</select></Field>
+      <div className="flex gap-2 mt-5">
+        <button onClick={onCancel} className="flex-1 py-2 rounded-md text-sm" style={{ border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft }}>Cancel</button>
+        <button onClick={() => name.trim() && onSave({ name: name.trim(), grade: grade.trim(), planType, disabilityCategory })} disabled={!name.trim()}
+          className="flex-1 py-2 rounded-md text-sm font-medium disabled:opacity-40" style={{ background: COLORS.navy, color: "#fff" }}>Save changes</button>
       </div>
     </ModalShell>
   );
@@ -961,10 +1189,19 @@ function LogEntryModal({ students, initial, onCancel, onSave, onDelete }) {
   );
 }
 
-function TeamModal({ student, onCancel, onSave }) {
+function TeamModal({ student, bank, roleOptions, onCancel, onSave }) {
   const [team, setTeam] = useState(student.team || []);
-  const [name, setName] = useState(""); const [role, setRole] = useState(ROLE_OPTIONS[0]);
+  const [name, setName] = useState(""); const [role, setRole] = useState(roleOptions[0] || "");
+  const [bankPick, setBankPick] = useState("");
+  const onCase = (n, r) => team.some((t) => t.name.trim().toLowerCase() === n.trim().toLowerCase() && t.role === r);
+  const bankOptions = (bank || []).filter((b) => !onCase(b.name, b.role));
   const add = () => { if (!name.trim()) return; setTeam([...team, { id: uid(), name: name.trim(), role }]); setName(""); };
+  const addFromBank = () => {
+    const b = bankOptions.find((x) => x.id === bankPick);
+    if (!b) return;
+    setTeam([...team, { id: uid(), name: b.name, role: b.role }]);
+    setBankPick("");
+  };
   return (
     <ModalShell title={`Team — ${student.name}`} onCancel={onCancel}>
       <div className="flex flex-col gap-2 mb-4">
@@ -976,16 +1213,367 @@ function TeamModal({ student, onCancel, onSave }) {
         ))}
         {team.length === 0 && <EmptyNote text="No team members yet." />}
       </div>
+
+      {bankOptions.length > 0 && (
+        <div className="flex gap-2 items-end mb-3.5">
+          <div className="flex-1"><Field label="Add from your team bank"><select style={inputStyle} value={bankPick} onChange={(e) => setBankPick(e.target.value)}>
+            <option value="">Choose someone…</option>
+            {bankOptions.map((b) => <option key={b.id} value={b.id}>{b.name} — {b.role}</option>)}
+          </select></Field></div>
+          <button onClick={addFromBank} disabled={!bankPick} className="mb-3.5 p-2 rounded-md disabled:opacity-40" style={{ background: COLORS.navy, color: "#fff" }}><Plus size={16} /></button>
+        </div>
+      )}
+
+      <div style={{ fontSize: 11.5, color: COLORS.muted, fontWeight: 600, marginBottom: 6 }}>Or add someone new</div>
       <div className="flex gap-2 items-end mb-1">
         <div className="flex-1"><Field label="Name"><input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Mrs. Walker" onKeyDown={(e) => e.key === "Enter" && add()} /></Field></div>
-        <div className="flex-1"><Field label="Role"><select style={inputStyle} value={role} onChange={(e) => setRole(e.target.value)}>{ROLE_OPTIONS.map((r) => <option key={r}>{r}</option>)}</select></Field></div>
+        <div className="flex-1"><Field label="Role"><select style={inputStyle} value={role} onChange={(e) => setRole(e.target.value)}>{roleOptions.map((r) => <option key={r}>{r}</option>)}</select></Field></div>
         <button onClick={add} className="mb-3.5 p-2 rounded-md" style={{ background: COLORS.navy, color: "#fff" }}><Plus size={16} /></button>
       </div>
+      <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 8 }}>New people are automatically added to your team bank for next time.</div>
       <div className="flex gap-2 mt-4">
         <button onClick={onCancel} className="flex-1 py-2 rounded-md text-sm" style={{ border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft }}>Cancel</button>
         <button onClick={() => onSave(team)} className="flex-1 py-2 rounded-md text-sm font-medium" style={{ background: COLORS.navy, color: "#fff" }}>Save team</button>
       </div>
     </ModalShell>
+  );
+}
+
+/* --------------------------------- Team bank --------------------------------- */
+function TeamBankView({ bank, roleOptions, students, onAdd, onDelete, onFilterPerson }) {
+  const [name, setName] = useState(""); const [role, setRole] = useState(roleOptions[0] || "");
+  const active = students.filter((s) => !s.archived);
+
+  const casesFor = (personName) => active.filter((s) => (s.team || []).some((m) => m.name.trim().toLowerCase() === personName.trim().toLowerCase())).map((s) => s.name);
+
+  const grouped = useMemo(() => {
+    const byRole = {};
+    [...bank].sort((a, b) => a.name.localeCompare(b.name)).forEach((b) => { (byRole[b.role] ||= []).push(b); });
+    return Object.entries(byRole).sort((a, b) => a[0].localeCompare(b[0]));
+  }, [bank]);
+
+  const exists = (n, r) => bank.some((b) => b.name.trim().toLowerCase() === n.trim().toLowerCase() && b.role === r);
+  const add = () => {
+    if (!name.trim() || exists(name, role)) return;
+    onAdd({ name: name.trim(), role });
+    setName("");
+  };
+
+  return (
+    <div className="p-6 md:p-8 max-w-4xl">
+      <div className="mb-6">
+        <h2 style={{ fontFamily: "'Newsreader', serif", fontSize: 26, fontWeight: 600, color: COLORS.navy }}>Team bank</h2>
+        <p style={{ color: COLORS.muted, fontSize: 13.5, marginTop: 2 }}>
+          Everyone you've worked with, in one place, ready to pick from next time you assign a case team.
+        </p>
+      </div>
+
+      <Panel title="Add someone new">
+        <div className="flex gap-2 items-end">
+          <div className="flex-1"><Field label="Name"><input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Mrs. Walker" onKeyDown={(e) => e.key === "Enter" && add()} /></Field></div>
+          <div className="flex-1"><Field label="Role"><select style={inputStyle} value={role} onChange={(e) => setRole(e.target.value)}>{roleOptions.map((r) => <option key={r}>{r}</option>)}</select></Field></div>
+          <button onClick={add} disabled={!name.trim()} className="mb-3.5 py-2 px-3 rounded-md text-sm font-medium disabled:opacity-40" style={{ background: COLORS.navy, color: "#fff" }}>Add to bank</button>
+        </div>
+      </Panel>
+
+      <div className="mt-6 flex flex-col gap-5">
+        {grouped.length ? grouped.map(([role, people]) => (
+          <Panel key={role} title={role}>
+            <div className="grid sm:grid-cols-2 gap-2">
+              {people.map((p) => {
+                const cases = casesFor(p.name);
+                return (
+                  <div key={p.id} className="p-3 rounded-lg flex items-start justify-between gap-2" style={{ background: COLORS.paper, border: `1px solid ${COLORS.line}` }}>
+                    <button onClick={() => cases.length && onFilterPerson(p.name)} className="text-left min-w-0">
+                      <div style={{ fontSize: 14, fontWeight: 600 }}>{p.name}</div>
+                      <div style={{ fontSize: 11.5, color: COLORS.muted }} className="truncate">
+                        {cases.length ? `${cases.length} case${cases.length === 1 ? "" : "s"}: ${cases.join(", ")}` : "Not on any active case yet"}
+                      </div>
+                    </button>
+                    <button onClick={() => onDelete(p.id)} title="Remove from bank" className="flex-shrink-0"><Trash2 size={13} color={COLORS.muted} /></button>
+                  </div>
+                );
+              })}
+            </div>
+          </Panel>
+        )) : <EmptyNote text="Nobody in your team bank yet. Add someone above, or they'll be added automatically the next time you assign a team to a case." />}
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------------- Settings --------------------------------- */
+function EditableListPanel({ title, description, items, usageCount, onAdd, onRename, onDelete, placeholder }) {
+  const [newVal, setNewVal] = useState("");
+  const [editing, setEditing] = useState(null); // the item currently being renamed
+  const [editVal, setEditVal] = useState("");
+
+  const startEdit = (item) => { setEditing(item); setEditVal(item); };
+  const commitEdit = () => {
+    if (editVal.trim() && editVal.trim() !== editing) onRename(editing, editVal.trim());
+    setEditing(null);
+  };
+  const add = () => { if (!newVal.trim()) return; onAdd(newVal.trim()); setNewVal(""); };
+  const remove = (item) => {
+    const n = usageCount(item);
+    const msg = n > 0
+      ? `"${item}" is currently used on ${n} ${n === 1 ? "record" : "records"}. Removing it only takes it out of the picker — existing records keep it as-is. Continue?`
+      : `Remove "${item}" from the list?`;
+    if (confirm(msg)) onDelete(item);
+  };
+
+  return (
+    <Panel title={title}>
+      <p style={{ color: COLORS.muted, fontSize: 12.5, marginTop: -6, marginBottom: 12 }}>{description}</p>
+      <div className="flex flex-col gap-1.5 mb-4">
+        {items.map((item) => (
+          <div key={item} className="flex items-center gap-2 p-2 rounded-md" style={{ background: COLORS.paper }}>
+            {editing === item ? (
+              <>
+                <input autoFocus style={{ ...inputStyle, padding: "6px 8px" }} value={editVal} onChange={(e) => setEditVal(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && commitEdit()} className="flex-1" />
+                <button onClick={commitEdit} className="text-xs font-medium px-2 py-1 rounded" style={{ background: COLORS.navy, color: "#fff" }}>Save</button>
+                <button onClick={() => setEditing(null)} className="text-xs px-1" style={{ color: COLORS.muted }}>Cancel</button>
+              </>
+            ) : (
+              <>
+                <span className="flex-1 text-sm">{item}</span>
+                {usageCount(item) > 0 && <span style={{ fontSize: 10.5, color: COLORS.muted }}>{usageCount(item)} in use</span>}
+                <button onClick={() => startEdit(item)} title="Rename"><Pencil size={13} color={COLORS.muted} /></button>
+                <button onClick={() => remove(item)} title="Remove"><Trash2 size={13} color={COLORS.muted} /></button>
+              </>
+            )}
+          </div>
+        ))}
+        {items.length === 0 && <EmptyNote text="Nothing here yet." />}
+      </div>
+      <div className="flex gap-2">
+        <input style={inputStyle} value={newVal} onChange={(e) => setNewVal(e.target.value)} placeholder={placeholder} onKeyDown={(e) => e.key === "Enter" && add()} />
+        <button onClick={add} disabled={!newVal.trim()} className="px-3 py-2 rounded-md text-sm font-medium disabled:opacity-40 flex-shrink-0" style={{ background: COLORS.navy, color: "#fff" }}>
+          <Plus size={15} />
+        </button>
+      </div>
+    </Panel>
+  );
+}
+
+function SettingsView({ planTypes, roleOptions, students, teamBank, onAddPlanType, onRenamePlanType, onDeletePlanType, onAddRole, onRenameRole, onDeleteRole }) {
+  const planUsage = (val) => students.filter((s) => s.planType === val).length;
+  const roleUsage = (val) =>
+    students.reduce((n, s) => n + (s.team || []).filter((m) => m.role === val).length, 0) +
+    teamBank.filter((b) => b.role === val).length;
+
+  return (
+    <div className="p-6 md:p-8 max-w-3xl">
+      <div className="mb-6">
+        <h2 style={{ fontFamily: "'Newsreader', serif", fontSize: 26, fontWeight: 600, color: COLORS.navy }}>Settings</h2>
+        <p style={{ color: COLORS.muted, fontSize: 13.5, marginTop: 2 }}>Manage the plan types and support roles available across the app.</p>
+      </div>
+      <div className="flex flex-col gap-6">
+        <EditableListPanel
+          title="Plan types" description="Renaming updates every case currently using that plan type. Removing one only takes it out of the picker — cases keep whatever they already had."
+          items={planTypes} usageCount={planUsage} onAdd={onAddPlanType} onRename={onRenamePlanType}
+          onDelete={onDeletePlanType} placeholder="Add a plan type…"
+        />
+        <EditableListPanel
+          title="Support roles" description="Renaming updates every case team and team bank entry using that role. Removing one only takes it out of the picker — existing assignments are unaffected."
+          items={roleOptions} usageCount={roleUsage} onAdd={onAddRole} onRename={onRenameRole}
+          onDelete={onDeleteRole} placeholder="Add a role…"
+        />
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------------- Sync & backup --------------------------------- */
+function SyncBackupView({ cloud, syncStatus, data, onImportLocalToCloud, onStartFreshInCloud, onImportDataToCloud, onRestoreBackup, onLoadSampleData, onClearAllData }) {
+  const [mode, setMode] = useState("signin"); // signin | create
+  const [email, setEmail] = useState(""); const [password, setPassword] = useState("");
+  const [importBusy, setImportBusy] = useState(false);
+  const [restoreError, setRestoreError] = useState("");
+  const [seedMode, setSeedMode] = useState(null); // null | "file" | "paste"
+  const [pasteText, setPasteText] = useState("");
+  const [seedError, setSeedError] = useState("");
+  const fileRef = useRef(null);
+  const seedFileRef = useRef(null);
+
+  const downloadBackup = () => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `caseload-backup-${todayISO()}.json`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleRestoreFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setRestoreError("");
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        if (!parsed || typeof parsed !== "object") throw new Error("not an object");
+        if (!confirm("Replace everything currently loaded with the contents of this backup file? This can't be undone.")) return;
+        onRestoreBackup(parsed);
+      } catch (e) {
+        setRestoreError("That file doesn't look like a valid backup.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const seedFromParsed = async (parsed) => {
+    setSeedError("");
+    if (!parsed || typeof parsed !== "object") { setSeedError("That doesn't look like valid backup data."); return; }
+    setImportBusy(true);
+    await onImportDataToCloud(parsed);
+    setImportBusy(false);
+    setSeedMode(null);
+  };
+  const handleSeedFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => { try { seedFromParsed(JSON.parse(reader.result)); } catch (e) { setSeedError("That file doesn't look like a valid backup."); } };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+  const handleSeedPaste = () => {
+    try { seedFromParsed(JSON.parse(pasteText)); } catch (e) { setSeedError("That doesn't look like valid backup text — check that you copied the whole thing."); }
+  };
+
+  return (
+    <div className="p-6 md:p-8 max-w-3xl">
+      <div className="mb-6">
+        <h2 style={{ fontFamily: "'Newsreader', serif", fontSize: 26, fontWeight: 600, color: COLORS.navy }}>Account &amp; sync</h2>
+        <p style={{ color: COLORS.muted, fontSize: 13.5, marginTop: 2 }}>
+          This app works fine with no account. Creating one is what lets the same caseload follow you to another device.
+        </p>
+      </div>
+
+      <div className="flex flex-col gap-6">
+        <Panel title="Your account">
+          {!cloud.configured ? (
+            <div style={{ fontSize: 13.5, color: COLORS.inkSoft }}>
+              Accounts aren't set up yet. This needs a free Firebase project — see the <strong>Sync setup</strong> section of the README for
+              step-by-step instructions. Until then, everything here works exactly as before, saved only on this device, no account needed.
+            </div>
+          ) : !cloud.ready ? (
+            <EmptyNote text="Connecting…" />
+          ) : cloud.user ? (
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center gap-2 text-sm p-2.5 rounded-md" style={{ background: COLORS.goldSoft }}>
+                <Cloud size={16} color={COLORS.navy} />
+                <span>Signed in as <strong>{cloud.user.email}</strong> — this device is synced to this account.</span>
+              </div>
+              {syncStatus === "needs-import" && !seedMode && (
+                <div className="p-3 rounded-lg flex flex-col gap-2" style={{ background: COLORS.paper, border: `1px solid ${COLORS.line}` }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>This account doesn't have any data yet — pick a starting point.</div>
+                  <div className="flex gap-2 flex-wrap mt-1">
+                    <button disabled={importBusy} onClick={async () => { setImportBusy(true); await onImportLocalToCloud(); setImportBusy(false); }}
+                      className="px-3 py-1.5 rounded-md text-xs font-medium disabled:opacity-40" style={{ background: COLORS.navy, color: "#fff" }}>Use this device's current data</button>
+                    <button disabled={importBusy} onClick={() => setSeedMode("choose")}
+                      className="px-3 py-1.5 rounded-md text-xs font-medium disabled:opacity-40" style={{ border: `1px solid ${COLORS.navy}`, color: COLORS.navy }}>Load from a backup</button>
+                    <button disabled={importBusy} onClick={async () => { setImportBusy(true); await onStartFreshInCloud(); setImportBusy(false); }}
+                      className="px-3 py-1.5 rounded-md text-xs" style={{ border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft }}>Start fresh</button>
+                  </div>
+                </div>
+              )}
+              {syncStatus === "needs-import" && seedMode === "choose" && (
+                <div className="p-3 rounded-lg flex flex-col gap-2" style={{ background: COLORS.paper, border: `1px solid ${COLORS.line}` }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>Load from a backup</div>
+                  <div style={{ fontSize: 12, color: COLORS.muted }}>Use a file from "Download backup" below, or paste text copied from browser storage.</div>
+                  <div className="flex gap-2 flex-wrap">
+                    <button onClick={() => seedFileRef.current?.click()} className="px-3 py-1.5 rounded-md text-xs font-medium" style={{ background: COLORS.navy, color: "#fff" }}>Upload a file…</button>
+                    <button onClick={() => setSeedMode("paste")} className="px-3 py-1.5 rounded-md text-xs font-medium" style={{ border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft }}>Paste text instead</button>
+                    <button onClick={() => setSeedMode(null)} className="px-3 py-1.5 rounded-md text-xs" style={{ color: COLORS.muted }}>Cancel</button>
+                  </div>
+                  <input ref={seedFileRef} type="file" accept="application/json" onChange={handleSeedFile} className="hidden" />
+                </div>
+              )}
+              {syncStatus === "needs-import" && seedMode === "paste" && (
+                <div className="p-3 rounded-lg flex flex-col gap-2" style={{ background: COLORS.paper, border: `1px solid ${COLORS.line}` }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>Paste backup text</div>
+                  <textarea rows={5} style={{ ...inputStyle, resize: "vertical", fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5 }} value={pasteText} onChange={(e) => setPasteText(e.target.value)} placeholder="Paste the full text here…" />
+                  <div className="flex gap-2">
+                    <button disabled={importBusy || !pasteText.trim()} onClick={handleSeedPaste} className="px-3 py-1.5 rounded-md text-xs font-medium disabled:opacity-40" style={{ background: COLORS.navy, color: "#fff" }}>Load this data</button>
+                    <button onClick={() => { setSeedMode(null); setPasteText(""); setSeedError(""); }} className="px-3 py-1.5 rounded-md text-xs" style={{ color: COLORS.muted }}>Cancel</button>
+                  </div>
+                </div>
+              )}
+              {seedError && <div style={{ color: COLORS.red, fontSize: 12 }}>{seedError}</div>}
+              {syncStatus === "synced" && <div style={{ fontSize: 12.5, color: COLORS.muted }}>Sign into this same account on another device to keep both up to date automatically.</div>}
+              <button onClick={cloud.signOutUser} className="self-start flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md" style={{ border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft }}>
+                <LogOut size={13} /> Sign out
+              </button>
+            </div>
+          ) : (
+            <div className="max-w-sm">
+              <div className="flex gap-1.5 mb-3 text-xs">
+                <button onClick={() => setMode("signin")} className="px-2.5 py-1 rounded-full" style={{ background: mode === "signin" ? COLORS.navy : "transparent", color: mode === "signin" ? "#fff" : COLORS.inkSoft, border: `1px solid ${mode === "signin" ? COLORS.navy : COLORS.line}` }}>Sign in</button>
+                <button onClick={() => setMode("create")} className="px-2.5 py-1 rounded-full" style={{ background: mode === "create" ? COLORS.navy : "transparent", color: mode === "create" ? "#fff" : COLORS.inkSoft, border: `1px solid ${mode === "create" ? COLORS.navy : COLORS.line}` }}>Create account</button>
+              </div>
+              <Field label="Email"><input type="email" style={inputStyle} value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
+              <Field label="Password"><input type="password" style={inputStyle} value={password} onChange={(e) => setPassword(e.target.value)} /></Field>
+              {cloud.authError && <div style={{ color: COLORS.red, fontSize: 12, marginBottom: 8 }}>{cloud.authError}</div>}
+              <button disabled={cloud.authBusy || !email || !password} onClick={() => cloud.signIn(email, password, mode)}
+                className="w-full py-2 rounded-md text-sm font-medium disabled:opacity-40" style={{ background: COLORS.navy, color: "#fff" }}>
+                {mode === "create" ? "Create account & sign in" : "Sign in"}
+              </button>
+              <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 8 }}>Use the same email and password on every device you want kept in sync.</div>
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="Manual backup">
+          <p style={{ color: COLORS.muted, fontSize: 12.5, marginBottom: 10 }}>
+            Works regardless of whether an account is set up. A good habit before trying something new.
+          </p>
+          <div className="flex gap-2 flex-wrap">
+            <button onClick={downloadBackup} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium" style={{ background: COLORS.navy, color: "#fff" }}>
+              <Download size={15} /> Download backup
+            </button>
+            <button onClick={() => fileRef.current?.click()} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium" style={{ border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft }}>
+              <Upload size={15} /> Restore from file
+            </button>
+            <input ref={fileRef} type="file" accept="application/json" onChange={handleRestoreFile} className="hidden" />
+          </div>
+          {restoreError && <div style={{ color: COLORS.red, fontSize: 12, marginTop: 8 }}>{restoreError}</div>}
+        </Panel>
+
+        <DangerZone onLoadSampleData={onLoadSampleData} onClearAllData={onClearAllData} />
+      </div>
+    </div>
+  );
+}
+
+function DangerZone({ onLoadSampleData, onClearAllData }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="p-4 rounded-lg" style={{ background: COLORS.redSoft, border: `1px solid ${COLORS.red}` }}>
+      <button onClick={() => setOpen(!open)} className="w-full flex items-center justify-between text-left">
+        <h3 style={{ fontSize: 13, fontWeight: 700, color: COLORS.red, textTransform: "uppercase", letterSpacing: "0.03em" }}>Danger zone</h3>
+        <ChevronRight size={16} color={COLORS.red} style={{ transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s" }} />
+      </button>
+      {open && (
+        <div className="flex flex-col gap-2 mt-3">
+          <p style={{ color: COLORS.inkSoft, fontSize: 12.5 }}>
+            These replace everything currently loaded, on this device (and in the cloud, if this device is synced). Download a backup first if you're unsure.
+          </p>
+          <div className="flex gap-2 flex-wrap">
+            <button onClick={onLoadSampleData} className="px-3 py-1.5 rounded-md text-xs font-medium" style={{ border: `1px solid ${COLORS.red}`, color: COLORS.red, background: "#fff" }}>
+              Reset to sample data
+            </button>
+            <button onClick={onClearAllData} className="px-3 py-1.5 rounded-md text-xs font-medium" style={{ background: COLORS.red, color: "#fff" }}>
+              Clear all data
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
